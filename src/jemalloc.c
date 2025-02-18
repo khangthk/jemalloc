@@ -985,44 +985,53 @@ obtain_malloc_conf(unsigned which_source, char readlink_buf[PATH_MAX + 1]) {
 		}
 		break;
 	case 2: {
+#ifndef JEMALLOC_CONFIG_FILE
+		ret = NULL;
+		break;
+#else
 		ssize_t linklen = 0;
-#ifndef _WIN32
+#  ifndef _WIN32
 		int saved_errno = errno;
 		const char *linkname =
-#  ifdef JEMALLOC_PREFIX
+#    ifdef JEMALLOC_PREFIX
 		    "/etc/"JEMALLOC_PREFIX"malloc.conf"
-#  else
+#    else
 		    "/etc/malloc.conf"
-#  endif
+#    endif
 		    ;
 
 		/*
 		 * Try to use the contents of the "/etc/malloc.conf" symbolic
 		 * link's name.
 		 */
-#ifndef JEMALLOC_READLINKAT
+#    ifndef JEMALLOC_READLINKAT
 		linklen = readlink(linkname, readlink_buf, PATH_MAX);
-#else
+#    else
 		linklen = readlinkat(AT_FDCWD, linkname, readlink_buf, PATH_MAX);
-#endif
+#    endif
 		if (linklen == -1) {
 			/* No configuration specified. */
 			linklen = 0;
 			/* Restore errno. */
 			set_errno(saved_errno);
 		}
-#endif
+#  endif
 		readlink_buf[linklen] = '\0';
 		ret = readlink_buf;
 		break;
-	} case 3: {
-		const char *envname =
-#ifdef JEMALLOC_PREFIX
-		    JEMALLOC_CPREFIX"MALLOC_CONF"
-#else
-		    "MALLOC_CONF"
 #endif
-		    ;
+	} case 3: {
+#ifndef JEMALLOC_CONFIG_ENV
+		ret = NULL;
+		break;
+#else
+		const char *envname =
+#  ifdef JEMALLOC_PREFIX
+			JEMALLOC_CPREFIX"MALLOC_CONF"
+#  else
+			"MALLOC_CONF"
+#  endif
+			;
 
 		if ((ret = jemalloc_getenv(envname)) != NULL) {
 			opt_malloc_conf_env_var = ret;
@@ -1031,6 +1040,7 @@ obtain_malloc_conf(unsigned which_source, char readlink_buf[PATH_MAX + 1]) {
 			ret = NULL;
 		}
 		break;
+#endif
 	} case 4: {
 		ret = je_malloc_conf_2_conf_harder;
 		break;
@@ -1039,44 +1049,6 @@ obtain_malloc_conf(unsigned which_source, char readlink_buf[PATH_MAX + 1]) {
 		ret = NULL;
 	}
 	return ret;
-}
-
-static bool
-validate_hpa_ratios(void) {
-	size_t hpa_threshold = fxp_mul_frac(HUGEPAGE, opt_hpa_opts.dirty_mult) +
-	    opt_hpa_opts.hugification_threshold;
-	if (hpa_threshold > HUGEPAGE) {
-		return false;
-	}
-
-	char hpa_dirty_mult[FXP_BUF_SIZE];
-	char hugification_threshold[FXP_BUF_SIZE];
-	char normalization_message[256] = {0};
-	fxp_print(opt_hpa_opts.dirty_mult, hpa_dirty_mult);
-	fxp_print(fxp_div(FXP_INIT_INT((unsigned)
-	    (opt_hpa_opts.hugification_threshold >> LG_PAGE)),
-	    FXP_INIT_INT(HUGEPAGE_PAGES)), hugification_threshold);
-	if (!opt_abort_conf) {
-		char normalized_hugification_threshold[FXP_BUF_SIZE];
-		opt_hpa_opts.hugification_threshold +=
-		    HUGEPAGE - hpa_threshold;
-		fxp_print(fxp_div(FXP_INIT_INT((unsigned)
-		    (opt_hpa_opts.hugification_threshold >> LG_PAGE)),
-		    FXP_INIT_INT(HUGEPAGE_PAGES)),
-		    normalized_hugification_threshold);
-		malloc_snprintf(normalization_message,
-		    sizeof(normalization_message), "<jemalloc>: Normalizing "
-		    "HPA settings to avoid pathological behavior, setting "
-		    "hpa_hugification_threshold_ratio: to %s.\n",
-		    normalized_hugification_threshold);
-	}
-	malloc_printf(
-	    "<jemalloc>: Invalid combination of options "
-	    "hpa_hugification_threshold_ratio: %s and hpa_dirty_mult: %s. "
-	    "These values should sum to > 1.0.\n%s", hugification_threshold,
-	    hpa_dirty_mult, normalization_message);
-
-	return true;
 }
 
 static void
@@ -1090,9 +1062,15 @@ validate_hpa_settings(void) {
 		    "<jemalloc>: huge page size (%zu) greater than expected."
 		    "May not be supported or behave as expected.", HUGEPAGE);
 	}
-	if (opt_hpa_opts.dirty_mult != (fxp_t)-1 && validate_hpa_ratios()) {
-		had_conf_error = true;
+#ifndef JEMALLOC_HAVE_MADVISE_COLLAPSE
+	if (opt_hpa_opts.hugify_sync) {
+	       had_conf_error = true;
+	       malloc_printf(
+		   "<jemalloc>: hpa_hugify_sync config option is enabled, "
+		   "but MADV_COLLAPSE support was not detected at build "
+		   "time.");
 	}
+#endif
 }
 
 static void
@@ -1566,6 +1544,9 @@ malloc_conf_init_helper(sc_data_t *sc_data, unsigned bin_shard_sizes[SC_NBINS],
 			    0, 0, CONF_DONT_CHECK_MIN, CONF_DONT_CHECK_MAX,
 			    false);
 
+			CONF_HANDLE_BOOL(
+			    opt_hpa_opts.hugify_sync, "hpa_hugify_sync");
+
 			CONF_HANDLE_UINT64_T(
 			    opt_hpa_opts.min_purge_interval_ms,
 			    "hpa_min_purge_interval_ms", 0, 0,
@@ -1646,6 +1627,10 @@ malloc_conf_init_helper(sc_data_t *sc_data, unsigned bin_shard_sizes[SC_NBINS],
 				    "prof_thread_active_init")
 				CONF_HANDLE_SIZE_T(opt_lg_prof_sample,
 				    "lg_prof_sample", 0, (sizeof(uint64_t) << 3)
+				    - 1, CONF_DONT_CHECK_MIN, CONF_CHECK_MAX,
+				    true)
+				CONF_HANDLE_SIZE_T(opt_experimental_lg_prof_threshold,
+				    "experimental_lg_prof_threshold", 0, (sizeof(uint64_t) << 3)
 				    - 1, CONF_DONT_CHECK_MIN, CONF_CHECK_MAX,
 				    true)
 				CONF_HANDLE_BOOL(opt_prof_accum, "prof_accum")
@@ -1979,13 +1964,6 @@ malloc_init_hard_a0_locked(void) {
 		} else {
 			opt_hpa = false;
 		}
-	} else if (opt_hpa) {
-		hpa_shard_opts_t hpa_shard_opts = opt_hpa_opts;
-		hpa_shard_opts.deferral_allowed = background_thread_enabled();
-		if (pa_shard_enable_hpa(TSDN_NULL, &a0->pa_shard,
-		    &hpa_shard_opts, &opt_hpa_sec_opts)) {
-			return true;
-		}
 	}
 
 	malloc_init_state = malloc_init_a0_initialized;
@@ -2239,6 +2217,20 @@ malloc_init_hard(void) {
 	if (malloc_init_narenas()
 	    || background_thread_boot1(tsd_tsdn(tsd), b0get())) {
 		UNLOCK_RETURN(tsd_tsdn(tsd), true, true)
+	}
+	if (opt_hpa) {
+		/*
+		 * We didn't initialize arena 0 hpa_shard in arena_new, because
+		 * background_thread_enabled wasn't initialized yet, but we
+		 * need it to set correct value for deferral_allowed.
+		 */
+		arena_t *a0 = arena_get(tsd_tsdn(tsd), 0, false);
+		hpa_shard_opts_t hpa_shard_opts = opt_hpa_opts;
+		hpa_shard_opts.deferral_allowed = background_thread_enabled();
+		if (pa_shard_enable_hpa(tsd_tsdn(tsd), &a0->pa_shard,
+		    &hpa_shard_opts, &opt_hpa_sec_opts)) {
+			UNLOCK_RETURN(tsd_tsdn(tsd), true, true)
+		}
 	}
 	if (config_prof && prof_boot2(tsd, b0get())) {
 		UNLOCK_RETURN(tsd_tsdn(tsd), true, true)

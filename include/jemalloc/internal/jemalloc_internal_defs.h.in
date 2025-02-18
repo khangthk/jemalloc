@@ -118,6 +118,11 @@
 #undef JEMALLOC_HAVE_CLOCK_REALTIME
 
 /*
+ * Defined if clock_gettime_nsec_np(CLOCK_UPTIME_RAW) is available.
+ */
+#undef JEMALLOC_HAVE_CLOCK_GETTIME_NSEC_NP
+
+/*
  * Defined if _malloc_thread_cleanup() exists.  At least in the case of
  * FreeBSD, pthread_key_create() allocates, which if used during malloc
  * bootstrapping will cause recursion into the pthreads library.  Therefore, if
@@ -304,6 +309,13 @@
 #undef JEMALLOC_HAVE_MADVISE_HUGE
 
 /*
+ * Defined if best-effort synchronous collapse of the native
+ * pages mapped by the memory range into transparent huge pages is supported
+ * via MADV_COLLAPSE arguments to madvise(2).
+ */
+#undef JEMALLOC_HAVE_MADVISE_COLLAPSE
+
+/*
  * Methods for purging unused pages differ between operating systems.
  *
  *   madvise(..., MADV_FREE) : This marks pages as being unused, such that they
@@ -398,6 +410,9 @@
 
 /* Adaptive mutex support in pthreads. */
 #undef JEMALLOC_HAVE_PTHREAD_MUTEX_ADAPTIVE_NP
+
+/* gettid() support */
+#undef JEMALLOC_HAVE_GETTID
 
 /* GNU specific sched_getcpu support */
 #undef JEMALLOC_HAVE_SCHED_GETCPU

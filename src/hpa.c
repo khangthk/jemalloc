@@ -25,6 +25,11 @@ static void hpa_dalloc_batch(tsdn_t *tsdn, pai_t *self,
 static uint64_t hpa_time_until_deferred_work(tsdn_t *tsdn, pai_t *self);
 
 bool
+hpa_hugepage_size_exceeds_limit() {
+	return HUGEPAGE > HUGEPAGE_MAX_EXPECTED_SIZE;
+}
+
+bool
 hpa_supported(void) {
 #ifdef _WIN32
 	/*
@@ -52,7 +57,7 @@ hpa_supported(void) {
 		return false;
 	}
 	/* As mentioned in pages.h, do not support If HUGEPAGE is too large. */
-	if (HUGEPAGE > HUGEPAGE_MAX_EXPECTED_SIZE) {
+	if (hpa_hugepage_size_exceeds_limit()) {
 		return false;
 	}
 	return true;
@@ -77,7 +82,6 @@ hpa_central_init(hpa_central_t *central, base_t *base, const hpa_hooks_t *hooks)
 	central->base = base;
 	central->eden = NULL;
 	central->eden_len = 0;
-	central->age_counter = 0;
 	central->hooks = *hooks;
 	return false;
 }
@@ -90,7 +94,7 @@ hpa_alloc_ps(tsdn_t *tsdn, hpa_central_t *central) {
 
 static hpdata_t *
 hpa_central_extract(tsdn_t *tsdn, hpa_central_t *central, size_t size,
-    bool *oom) {
+    uint64_t age, bool *oom) {
 	/* Don't yet support big allocations; these should get filtered out. */
 	assert(size <= HUGEPAGE);
 	/*
@@ -113,7 +117,7 @@ hpa_central_extract(tsdn_t *tsdn, hpa_central_t *central, size_t size,
 			malloc_mutex_unlock(tsdn, &central->grow_mtx);
 			return NULL;
 		}
-		hpdata_init(ps, central->eden, central->age_counter++);
+		hpdata_init(ps, central->eden, age);
 		central->eden = NULL;
 		central->eden_len = 0;
 		malloc_mutex_unlock(tsdn, &central->grow_mtx);
@@ -163,7 +167,7 @@ hpa_central_extract(tsdn_t *tsdn, hpa_central_t *central, size_t size,
 	assert(central->eden_len % HUGEPAGE == 0);
 	assert(HUGEPAGE_ADDR2BASE(central->eden) == central->eden);
 
-	hpdata_init(ps, central->eden, central->age_counter++);
+	hpdata_init(ps, central->eden, age);
 
 	char *eden_char = (char *)central->eden;
 	eden_char += HUGEPAGE;
@@ -210,6 +214,7 @@ hpa_shard_init(hpa_shard_t *shard, hpa_central_t *central, emap_t *emap,
 	shard->stats.npurge_passes = 0;
 	shard->stats.npurges = 0;
 	shard->stats.nhugifies = 0;
+	shard->stats.nhugify_failures = 0;
 	shard->stats.ndehugifies = 0;
 
 	/*
@@ -242,6 +247,7 @@ hpa_shard_nonderived_stats_accum(hpa_shard_nonderived_stats_t *dst,
 	dst->npurge_passes += src->npurge_passes;
 	dst->npurges += src->npurges;
 	dst->nhugifies += src->nhugifies;
+	dst->nhugify_failures += src->nhugify_failures;
 	dst->ndehugifies += src->ndehugifies;
 }
 
@@ -499,10 +505,23 @@ hpa_try_hugify(tsdn_t *tsdn, hpa_shard_t *shard) {
 
 	malloc_mutex_unlock(tsdn, &shard->mtx);
 
-	shard->central->hooks.hugify(hpdata_addr_get(to_hugify), HUGEPAGE);
+	bool err = shard->central->hooks.hugify(hpdata_addr_get(to_hugify),
+	    HUGEPAGE, shard->opts.hugify_sync);
 
 	malloc_mutex_lock(tsdn, &shard->mtx);
 	shard->stats.nhugifies++;
+	if (err) {
+		/*
+		 * When asynchronious hugification is used
+		 * (shard->opts.hugify_sync option is false), we are not
+		 * expecting to get here, unless something went terrible wrong.
+		 * Because underlying syscall is only setting kernel flag for
+		 * memory range (actual hugification happens asynchroniously
+		 * and we are not getting any feedback about its outcome), we
+		 * expect syscall to be successful all the time.
+		 */
+		shard->stats.nhugify_failures++;
+	}
 
 	psset_update_begin(&shard->psset, to_hugify);
 	hpdata_hugify(to_hugify);
@@ -718,7 +737,8 @@ hpa_alloc_batch_psset(tsdn_t *tsdn, hpa_shard_t *shard, size_t size,
 	 * deallocations (and allocations of smaller sizes) may still succeed
 	 * while we're doing this potentially expensive system call.
 	 */
-	hpdata_t *ps = hpa_central_extract(tsdn, shard->central, size, &oom);
+	hpdata_t *ps = hpa_central_extract(tsdn, shard->central, size,
+	    shard->age_counter++, &oom);
 	if (ps == NULL) {
 		malloc_mutex_unlock(tsdn, &shard->grow_mtx);
 		return nsuccess;
